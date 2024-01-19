@@ -77,7 +77,7 @@ class Segment:
                                   loader.dataset, X, y_target, y_pred, idx)
         loss_avg = loss_avg / N
         metrics = [metrics[m] / N for m in range(M)]
-        #self.scheduler.step()
+        
         
         if self.train_output is not None:
             f = open(self.train_output, 'a')
@@ -86,9 +86,10 @@ class Segment:
                 f.write(f' {metrics[m]:>.5f}')
             f.write(f'\n')
             f.close()
-
+            
+        
         if epoch % self.print_training_metrics_on_epoch == 0:
-            print(f'Epoch={epoch} : loss={loss_avg:>.4f}')
+            print(f'Epoch={epoch} : loss={loss_avg:>.4f}, lr={self.scheduler.get_last_lr()[0]:>.5f}')
         
 
             
@@ -116,16 +117,17 @@ class Segment:
 
             y_target = torch.argmax(y, dim=1)
             y_pred = torch.argmax(logits, dim=1)
-
+            
             if metrics_list is not None:
                 metrics = [metrics[m] + metrics_list[m](y_pred, y_target) for m in range(M)]
 
             if save_output and self.output_folder is not None:
                 self._save_output(os.path.join(self.output_folder, "valid_data"),
                                   loader.dataset, X, y_target, y_pred, idx)
-
+            
         loss_avg = loss_avg / N
         metrics = [metrics[m] / N for m in range(M)]
+        self.scheduler.step()
 
         if self.valid_output is not None:
             f = open(self.valid_output, 'a')

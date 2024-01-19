@@ -74,21 +74,21 @@ class Segment(pl.LightningModule):
         
         output = self.model(inputs)
         train_loss = self.loss(output, target, gpu=True)
+        loss = train_loss
         self.optimizer.step()
-        
+
         [self.train_metrics[i].update(output, target) for i in range(len(self.train_metrics))]
         [self.log('train_loss', train_loss, prog_bar=False, logger=True, on_epoch=True, sync_dist=True)]
-        loss = train_loss
 
         [self.log('train_metric_%d' % i, self.train_metrics[i], \
                   prog_bar=False, logger=False, on_epoch=True, sync_dist=True) \
          for i in range(len(self.train_metrics))]
-
+        """
         if (self.save_train_output_every != 0) and ((self.current_epoch + 1) % self.save_train_output_every == 0):
             self.save_output(os.path.join(self.output_folder, "train_data", str(self.current_epoch)),
                              self.train_data, inputs, target, output, idx)
-
-        #[self.log('learning_rate', self.trainer.optimizers[0].param_groups[0]['lr'], prog_bar=True, logger=True)]
+        """
+        [self.log('learning_rate', self.trainer.optimizers[0].param_groups[0]['lr'], prog_bar=True, logger=True)]
         
         return loss
         
@@ -103,18 +103,18 @@ class Segment(pl.LightningModule):
 
         output = self.model(inputs)
         valid_loss = self.loss(output, target, gpu=True)
-        
-        [self.valid_metrics[i].update(output, target) for i in range(len(self.valid_metrics))]
         loss = valid_loss
 
+        [self.valid_metrics[i].update(output, target) for i in range(len(self.valid_metrics))]
+        
         [self.log('valid_metric_%d' % i, self.valid_metrics[i], \
                   prog_bar=False, logger=False, on_epoch=True, sync_dist=True) \
          for i in range(len(self.valid_metrics))]
-        
+        """
         if (self.save_valid_output_every != 0) and ((self.current_epoch + 1) % self.save_valid_output_every == 0):
             self.save_output(os.path.join(self.output_folder, "valid_data", str(self.current_epoch)),
                              self.valid_data, inputs, target, output, idx)
-
+        """
         return loss
 
 
@@ -132,15 +132,15 @@ class Segment(pl.LightningModule):
        
         [self.test_metrics[i].update(output, target) for i in range(len(self.test_metrics))]
         loss = test_loss
-        
+
         [self.log('test_loss', test_loss, prog_bar=True, logger=True)]
         [self.log('test_metric_%d' % i, self.test_metrics[i], \
                   prog_bar=True, logger=True, sync_dist=True) for i in range(len(self.test_metrics))]
-
+        """
         if self.output_folder is not None:
             self.save_output(os.path.join(self.output_folder, "test_data"),
                              self.test_data, inputs, target, output, idx)
-
+        """
         return loss
 
 
@@ -165,11 +165,12 @@ class Segment(pl.LightningModule):
             
     def training_epoch_end(self, outputs):
         avg_loss = torch.stack([x['loss'] for x in outputs]).mean().item()
-        train_metrics = [self.train_metrics[i].compute().item() for i in range(len(self.train_metrics))]
-        valid_metrics = [self.valid_metrics[i].compute().item() for i in range(len(self.valid_metrics))]
-        
-        print(f'{self.current_epoch} {avg_loss:>.4f}')
-        
+        #train_metrics = [self.train_metrics[i].compute().item() for i in range(len(self.train_metrics))]
+        #valid_metrics = [self.valid_metrics[i].compute().item() for i in range(len(self.valid_metrics))]
+        last_lr = self.configure_optimizers()['lr_scheduler']['scheduler'].get_last_lr()[0]
+
+        print(f'Epoch {self.current_epoch} : loss={avg_loss:>.4f}, last_lr={last_lr:>.5f}')
+        """
         if (self.save_train_output_every != 0) and ((self.global_step + 1) % self.save_train_output_every == 0):
              if self.train_output is not None:
                 f = open(self.train_output, 'a')
@@ -180,6 +181,7 @@ class Segment(pl.LightningModule):
                     f.write(f' {valid_metrics[i]:>.5f}')
                 f.write(f'\n')
                 f.close()
+        """
         
         
     #def validation_epoch_end(self, outputs):
@@ -201,6 +203,7 @@ class Segment(pl.LightningModule):
             f.write('\n')
             f.close()
 
+
     def configure_optimizers(self):
         def lr(step):
             if self.schedule == 'poly':
@@ -212,9 +215,15 @@ class Segment(pl.LightningModule):
         
         if self.schedule == 'plateau':
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer)
+        elif self.schedule=='ConstantLR':
+            scheduler = torch.optim.lr_scheduler.ConstantLR(self.optimizer,
+                                                            total_iters=300,
+                                                            factor=0.5
+            )
         else:
             scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr)
-        lr_scheduler = {'interval':'epoch' if self.schedule == 'plateau' else 'step', \
+        
+        lr_scheduler = {'interval':'epoch' if self.schedule == 'ConstantLR' else 'step', \
                         'scheduler':scheduler, 'monitor':'val_metric0'}
 
         return {'optimizer':self.optimizer, 'lr_scheduler':lr_scheduler}

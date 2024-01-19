@@ -37,15 +37,14 @@ function call-train(){
     
     # Define inputs
     data_config='configs/data/data_config_t1.csv'
-    aug_config='dataset/augmentation_parameters.txt'
     batch_size=1
-    max_n_epochs=2000
+    max_n_epochs=10
     network='UNet3D_3layers'
     optim='Adam'
     loss='dice_cce_loss'
-    lr_start=0.0001
+    lr_start=0.001
     weight_decay=0.002
-    lr_scheduler='PolynomialLR'
+    lr_scheduler='ConstantLR'
   
     metrics_train="MeanDice"
     metrics_valid="MeanDice"

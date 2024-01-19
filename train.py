@@ -13,7 +13,7 @@ from data_utils import transforms as t
 
 import options
 import models
-from models import optimizers, unet, metrics
+from models import unet, metrics
 from models.segment import Segment as segment
 import models.loss_functions as loss_fns
 
@@ -125,29 +125,26 @@ def main(pargs):
     
     
     ### Model set-up ###
-    activation_function = pargs.activation_function
-    n_levels = pargs.n_levels
     max_n_epochs = pargs.max_n_epochs
-    network = pargs.network
-    pooling_function = pargs.pooling_function
-    
-    network = models.unet.__dict__[network](in_channels=train_data.__numinput__(),
-                                            out_channels=train_data.__numclass__(),
+    network = models.unet.__dict__[pargs.network](in_channels=train_data.__numinput__(),
+                                                  out_channels=train_data.__numclass__(),
     ).to(device)
-    
 
     ### Optimizer set-up ###
     loss_function =  loss_fns.__dict__[pargs.loss]
     #optimizer, lr_scheduler = _config_optimizer(pargs, network.parameters())
 
-    lr_start = 0.0001 #args.lr_start
-    lr_param = 0.1 #args.lr_param
-    decay = 0.002 #args.weight_decay
-    optimizer = models.optimizers.adam(network.parameters(),
-                                       lr=lr_start,
-                                       weight_decay=decay
+    lr_start = pargs.lr_start
+    #lr_param = 0.1 #args.lr_param
+    decay = pargs.weight_decay
+    optimizer = torch.optim.Adam(network.parameters(),
+                                 lr=lr_start,
+                                 weight_decay=decay
     )
-    lr_scheduler = torch.optim.lr_scheduler.PolynomialLR(optimizer, total_iters=5, power=0.9)
+    lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer,
+                                                       total_iters=max_n_epochs,
+                                                       factor=0.5
+    )
 
     ## Metrics set-up ###
     metrics_train = [models.metrics.__dict__[pargs.metrics_train[i]] \
@@ -203,7 +200,7 @@ def main(pargs):
         
     trainer.test(loader=test_loader,
                  metrics_list=metrics_test,
-                 save_output=True
+                 save_output=False
     )
     
     

@@ -2,14 +2,14 @@
 
 #  SLURM STUFF
 #SBATCH --account=lcnrtx
-#SBATCH --partition=lcnrtx
+#SBATCH --partition=rtx8000
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=10G
 #SBATCH --gpus=1
 #SBATCH --time=1-08:00:00
-#SBATCH --job-name=ppseg
+#SBATCH --job-name=ppseg_pl
 
 csv_t1=dataset/data_config_t1.csv
 csv_t2=dataset/data_config_t2.csv
@@ -50,16 +50,15 @@ function call-train_crop(){
     # Define inputs
     seed=0
     data_config='configs/data/data_config_'$input_data'.csv'
-    aug_config='dataset/augmentation_parameters.txt'
     batch_size=1
-    max_n_epochs=500
+    max_n_epochs=10 #300
     network='UNet3D_'${n_layers}'layers'
-    optim='adam'
+    optim='Adam'
     loss='dice_cce_loss'
-    lr_start=0.0001
-    lr_param=0.1
-    decay=0.002
-    schedule='poly'
+    lr_start=0.001
+    weight_decay=0.002
+    lr_scheduler='ConstantLR'
+
     metrics_train="MeanDice" # HausDist2"
     metrics_valid="MeanDice" # HausDist2"
     metrics_test="MeanDice" # HausDist2"
@@ -67,22 +66,25 @@ function call-train_crop(){
     mkdir -p $output_dir
     
     # Run train
-    python3 train_cropdata_pl.py \
+    python3 train_pl.py \
+	    --data_config $data_config \
+	    --weight_decay $weight_decay \
+            --lr_start $lr_start \
+            --max_n_epochs $max_n_epochs \
 	    --metrics_test $metrics_test \
 	    --metrics_train $metrics_train \
 	    --metrics_valid $metrics_valid \
 	    --n_workers $n_workers \
 	    --optim $optim \
 	    --output_dir $output_dir \
-	    --lr_scheduler $schedule \
-	    --seed $seed 
+	    --lr_scheduler $lr_scheduler 
 }
 
 
 
 function main(){
     if [ $run_type == 'slurm' ] ; then
-	sbatch --array=0 --output=slurm_outputs/sanity_check_pl2.out $0 call-train_crop
+	sbatch --array=0 --output=slurm_outputs/sanity_check_pl.out $0 call-train_crop
     else
 	call-train_crop 0
     fi
