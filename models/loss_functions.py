@@ -3,79 +3,72 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import interpol
+#import interpol
 
-from scipy.ndimage import distance_transform_edt
+#from scipy.ndimage import distance_transform_edt
 
 
-def cce_loss(logits, targets, weights=1, reduction='mean', **kwargs):
-    weights = torch.as_tensor(weights, device=logits.device)
-    outputs = torch.log_softmax(logits, dim=1)
-    numer = torch.sum(weights * -(targets * outputs), keepdim=True, axis=1)
-    denom = torch.sum(weights * (targets), keepdim=True, axis=1)
+def cce_loss(output, target, weight=1, compute_softmax=True, **kwargs):
+    log_output = torch.log_softmax(output, dim=1) if compute_softmax else torch.log(output)
+    loss = -1 * (log_output * target).sum() / target.sum()
+    return weight * loss
 
-    if reduction == 'none':
-        return numer
+
+def dice_loss(output, target, weight=1, compute_softmax=True, exclude_background=False, **kwargs):
+    start_idx = 1 if exclude_background else 0
+    output = torch.flatten(F.softmax(output[:, start_idx:, ...], dim=1) if compute_softmax \
+                           else output[:, start_idx:, ...])
+    target = torch.flatten(target[:, start_idx:, ...])
+    numer = 2 * torch.sum(output * target) + 1e-5
+    denom = torch.sum(output + target) + 1e-5
+
+    loss = 1 - (numer/denom)
+    return weight * loss
+
+
+def mean_dice_loss(output, target, weight=1, compute_softmax=True, exclude_background=False, **kwargs):
+    start_idx = 1 if exclude_background else 0
+    output = F.softmax(output, dim=1) if compute_softmax else output
+    numer = torch.stack([2 * torch.sum(output[:,i,...] * target[:,i,...]) \
+                         for i in range(start_idx, target.shape[1])])
+    denom = torch.stack([torch.sum(output[:,i,...] + target[:,i,...]) + 1e-8 \
+                         for i in range(start_idx, target.shape[1])])
+    loss = 1 - torch.mean(numer/denom)
+    return weight * loss
+
+
+def mse_loss(output, target, weight=1, compute_softmax=True, exclude_background=True, **kwargs):
+    start_idx = 1 if exclude_background else 0
+    output = F.softmax(output, dim=1) if compute_softmax else output
+    loss = ((output[:,start_idx:,...] - target[:,start_idx:,...]) ** 2).sum() / target[:,start_idx:,...].sum()
+
+    return weight * loss
+
+
+
+def mse_loss_logits(output, target, weight=1, rescale_factor=5, exclude_background=True, **kwargs):
+    start_idx = 1 if exclude_background else 0
+    target_rescale = rescale_factor * (2 * target - 1)
+    loss = ((output[:,start_idx:,...] - target_rescale[:,start_idx:,...]) ** 2).sum() / target[:,start_idx:,...].sum()
     
-    return torch.sum(numer) / torch.sum(denom)
+    return weight * loss
 
 
-def dice_cce_loss(logits, targets, softmax=True, **kwargs):
-    return dice_loss_safe(logits, targets, start_idx=1) + cce_loss(logits, targets)
+def mean_mse_loss_logits(output, target, weight=1, rescale_factor=1, exclude_background=False, **kwargs):
+    start_idx = 1 if exclude_background else 0
+    output_rescale = rescale_factor * (2 * (output - output.min())/ (output.max() - output.min()) - 1)
+    target_rescale = rescale_factor * (2 * target - 1)
+    mse = torch.stack([((output_rescale[:,i,...] - target_rescale[:,i,...]) ** 2).sum() / \
+                       target[:,i,...].sum() for i in range(start_idx, target.shape[1])])
+    loss = torch.mean(mse)
+    
+    return weight * loss
 
 
-def dice_loss(logits, targets, weights=1, start_idx=0, softmax=True, **kwargs):
-    weights = torch.as_tensor(weights, device=logits.device)
-    outputs = F.softmax(logits, dim=1) if softmax else logits
-    axes = [0] + list(range(2, outputs.ndim))
-    numer = torch.sum(weights * (outputs * targets * 2), axis=axes) + 1e-5
-    denom = torch.sum(weights * (outputs * outputs + targets * targets), axis=axes) + 1e-5
+def mean_mse_loss_logits_yesbackground(output, target, weight=1, **kwargs):
+    loss = mean_mse_loss_logits(output, target, weight, exclude_background=False)
+    return loss
 
-    return torch.mean(1 - numer[start_idx:] / (denom[start_idx:] + 1e-8))
-
-
-def dice_loss_safe(logits, targets, weights=1, start_idx=1, softmax=True, **kwargs):
-    weights = torch.as_tensor(weights, device=logits.device)
-    outputs = F.softmax(logits, dim=1) if softmax else logits
-    axes = [0] + list(range(2, outputs.ndim))
-    numer = 2 * torch.sum(weights * (outputs * targets), axis=axes) + 1e-5
-    denom = 1 * torch.sum(weights * (outputs + targets), axis=axes) + 1e-5
-
-    return torch.mean(1 - numer[start_idx:] / (denom[start_idx:] + 1e-8))
-
-
-
-def surf_dist(logits, targets, p=2, reduction='sum', **kwargs):
-    count = torch.zeros(outputs.shape[1], device=logits.device)
-    sumsq = torch.zeros(outputs.shape[1], device=logits.device)
-
-    outputs = logits.argmax(dim=1).long().cpu()
-    targets = targets.argmax(dim=1).long().cpu()
-
-    for i in range(count.shape[0]):
-        h_target = torch.as_tensor(distance_transform_edt(targets != i) - 0) \
-                 - torch.as_tensor(distance_transform_edt(targets == i) - 1)
-
-        h_output = torch.as_tensor(distance_transform_edt(outputs != i) - 0) \
-                 - torch.as_tensor(distance_transform_edt(outputs == i) - 1)
-
-        count[i] = count[i] + (h_output == 0).sum()
-        sumsq[i] = sumsq[i] + (h_target[h_output == 0].abs() ** p).sum()
-
-        count[i] = count[i] + (h_target == 0).sum()
-        sumsq[i] = sumsq[i] + (h_output[h_target == 0].abs() ** p).sum()
-
-    if reduction=='none':
-        return (sumsq / (count + 1e-10)) ** (1/p)
-
-    if reduction=='mean':
-        return (sumsq / (count + 1e-10)).mean() ** (1/p)
-
-    if reduction=='sum':
-        return (sumsq.sum() / count.sum()) ** (1/p)
-
-def surf_dist_class(logits, targets, p=2, **kwargs):
-    return surf_dist(logits, targets, p, reduction='none', **kwargs)
-
-def haus_dist(logits, targets, p=8, **kwargs):
-    return surf_dist(logits, targets, p, **kwargs)
+def mean_mse_loss_logits_nobackground(output, target, weight=1, **kwargs):
+    loss = mean_mse_loss_logits(output, target, weight, exclude_background=True)
+    return loss
