@@ -30,13 +30,19 @@ class Compose(transforms.Compose):
 
 
 class GetPatch:
-    def __init__(self, patch_size:[int, list], n_dims:int, randomize:bool=False):
-        self.X = n_dims
-        self.patch_size = [patch_size] * n_dims if isinstance(patch_size, int) else patch_size
-        self.randomize = randomize
-
-        if self.randomize:  npr.seed()
-
+    def __init__(self, patch_size:[int, list], X:int, randomize:bool=False):
+        self.X = X
+        self.patch_size = [patch_size] * X if isinstance(patch_size, int) else patch_size
+        self.check_patch_tol = 0.1
+        
+        if randomize:
+            npr.seed()
+            self.get_bounds = self._get_random_bounds
+            self.check_patch = True
+        else:
+            self.get_bounds = self._get_center_bounds
+            self.check_patch = False
+            
 
     def _get_center_bounds(self, in_sz):
         vol_sz = list(in_sz[-self.X:])
@@ -51,27 +57,36 @@ class GetPatch:
         idx = [npr.randint(0, (vol_sz[i] - patch_sz[i])) for i in range(self.X)]
         bounds = [(idx[i], idx[i] + patch_sz[i]) for i in range(self.X)]
         return bounds
+
         
     
-    def _get_patch(self, vols):
-        crop = [None] * len(vols)
-        get_bounds = self._get_random_bounds if self.randomize else self._get_center_bounds
-
+    def _get_patch(self, vol, bounds):
         if self.X == 2:
-            h, w = get_bounds(vols[0].shape)
-            for i in range(len(vols)):
-                crop[i] = vols[i][..., h[0]:h[1], w[0]:w[1]]
+            h, w = bounds
+            crop = vol[..., h[0]:h[1], w[0]:w[1]]
         elif self.X >= 3:
-            h, w, d = get_bounds(vols[0].shape)
-            for i in range(len(vols)):
-                crop[i] = vols[i][..., h[0]:h[1], w[0]:w[1], d[0]:d[1]]
+            h, w, d = bounds
+            crop = vol[..., h[0]:h[1], w[0]:w[1], d[0]:d[1]]
         else:
-            print(f'Invalid n_dims (X=={self.X}')
+            print(f'Invalid X (X=={self.X}')
+
         return crop
                 
         
     def __call__(self, img, seg):
-        img, seg = self._get_patch([img, seg])
+        crop_seg = torch.zeros(list(seg.shape[:2]) + list(self.patch_size))
+        
+        if self.check_patch:
+            while abs(crop_seg[:, 1:, ...].sum().item() - seg[:, 1:, ...].sum().item()) > self.check_patch_tol:
+                bounds = self.get_bounds(seg.shape)
+                crop_seg = self._get_patch(seg, bounds)
+            img = self._get_patch(img, bounds)
+            seg = self._get_patch(seg, bounds)
+        else:
+            bounds = self.get_bounds(seg.shape)
+            img = self._get_patch(img, bounds)
+            seg = self._get_patch(seg, bounds)
+     
         return img, seg
 
 
@@ -86,35 +101,35 @@ class RandomElasticAffineCrop:
                  n_elastic_control_pts:int=5,
                  n_elastic_steps:int=0,
                  order:int=3,
-                 n_dims:int=3,
+                 X:int=3,
                  **kwargs
     ):
-        self.X = X = n_dims
-        if isinstance(translation_bounds, list): assert len(translation_bounds) == n_dims
-        if isinstance(rotation_bounds, list): assert len(rotation_bounds) == n_dims
-        if isinstance(shear_bounds, list): assert len(shear_bounds) == n_dims
-        if isinstance(scale_bounds, list): assert len(scale_bounds) == n_dims
+        self.X = X
+        if isinstance(translation_bounds, list): assert len(translation_bounds) == X
+        if isinstance(rotation_bounds, list): assert len(rotation_bounds) == X
+        if isinstance(shear_bounds, list): assert len(shear_bounds) == X
+        if isinstance(scale_bounds, list): assert len(scale_bounds) == X
 
-        self.translations = [translation_bounds] * X \
+        self.translation_bounds = [translation_bounds] * X \
             if isinstance(translation_bounds, float) else translation_bounds
-        self.rotations = [rotation_bounds] * X \
+        self.rotation_bounds = [rotation_bounds] * X \
             if isinstance(rotation_bounds, float) else rotation_bounds
-        self.shears = [shear_bounds]  * X \
+        self.shear_bounds = [shear_bounds]  * X \
             if isinstance(shear_bounds, float) else shear_bounds
-        self.zooms = [scale_bounds]  * X \
+        self.scale_bounds = [scale_bounds]  * X \
             if isinstance(scale_bounds, float) else scale_bounds
-        self.dmax = [max_elastic_displacement] * X \
+        self.max_elastic_displacement = [max_elastic_displacement] * X \
             if isinstance(max_elastic_displacement, float) else max_elastic_displacement
-        self.shape = n_elastic_control_pts
-        self.steps = n_elastic_steps
+        self.n_elastic_control_pts = n_elastic_control_pts
+        self.n_elastic_steps = n_elastic_steps
         
-        self.transform = cc.RandomAffineElasticTransform(translations=self.translations,
-                                                         rotations=self.rotations,
-                                                         shears=self.shears,
-                                                         zooms=self.zooms,
-                                                         dmax=self.dmax,
-                                                         shape=self.shape,
-                                                         steps=self.steps,
+        self.transform = cc.RandomAffineElasticTransform(translations=self.translation_bounds,
+                                                         rotations=self.rotation_bounds,
+                                                         shears=self.shear_bounds,
+                                                         zooms=self.scale_bounds,
+                                                         dmax=self.max_elastic_displacement,
+                                                         shape=self.n_elastic_control_pts,
+                                                         steps=self.n_elastic_steps,
         )
         
         
@@ -153,22 +168,37 @@ class MinMaxNorm:
         o_max = self.maxim
 
         img = (o_max - o_min) * (img - i_min) / (i_max - i_min) + o_min
+
         return img, seg
 
                
 
 class ContrastAugmentation:
+    """
     def __init__(self, gamma_range:list=(0.5, 2)):
         self.gamma_range = gamma_range if len(gamma_range)==2 \
             else Exception("Invalid gamma_range (must be (min max))")
+        #self.transform = cc.RandomGammaTransform(gamma=gamma_range)
 
-        self.transform = cc.RandomGammaTransform(gamma=gamma_range)
-
-    
     def __call__(self, img, seg):
-        img = self.transform(img)
+        breakpoint()
+        #img = self.transform(img)
+        img = _gamma_transform(img)
         return img, seg
-
+    """
+    def __init__(self, gamma_std:float=0.5):
+        self.stdev = gamma_std
+        npr.seed()
+        
+    def _gamma_transform(self, img):
+        gamma = npr.normal(0., self.stdev)
+        img = img.pow(np.exp(gamma))
+        return img
+        
+    def __call__(self, img, seg):
+        img = self._gamma_transform(img)
+        return img, seg
+    
 
     
 class BiasField:
@@ -203,9 +233,9 @@ class GaussianNoise:
 
 
 class AssignOneHotLabels():
-    def __init__(self, label_values:list=None, n_dims:int=3, index=0):
+    def __init__(self, label_values:list=None, X:int=3, index=0):
         self.label_values = label_values
-        self.n_dims = n_dims
+        self.X = X
         self.index = index
 
         
@@ -214,11 +244,11 @@ class AssignOneHotLabels():
             self.label_values = torch.unique((seg))
         
         onehot = torch.zeros(seg.shape).to(seg.device)
-        if self.n_dims == 4:
+        if self.X == 4:
             onehot = onehot.repeat(1,len(self.label_values),1,1,1,1)
-        elif self.n_dims == 3:
+        elif self.X == 3:
             onehot = onehot.repeat(1,len(self.label_values),1,1,1)
-        elif self.n_dims == 2:
+        elif self.X == 2:
             onehot = onehot.repeat(1,len(self.label_values),1,1)
 
         seg = torch.squeeze(seg)

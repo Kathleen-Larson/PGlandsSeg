@@ -1,5 +1,4 @@
-import os
-import time
+import os, time, shutil
 import pathlib as Path
 import numpy as np
 import freesurfer as fs
@@ -12,25 +11,29 @@ from torch.cuda.amp import autocast
 
 
 class Segment:
-    def __init__(self, model, optimizer, scheduler, loss_function, device,
-                 output_folder, max_n_epochs, start_epoch=0, start_full_aug_on=None,
+    def __init__(self, model, optimizer, scheduler, loss_functions:list, device,
+                 output_folder, max_n_epochs, steps_per_epoch, start_epoch=0, start_full_aug_on=None,
                  metrics_train=None, metrics_valid=None, metrics_test=None,
-                 use_multiple_optimizers=False, switch_loss_weight_every=20):
+                 use_multiple_optimizers=False, switch_loss_on:int=125, **kwargs):
         super().__init__()
 
         self.device = device
         self.model = model
 
-        self.loss_fn = loss_function
+        self.loss_functions = loss_functions
+        self.loss_fn = self.loss_functions[0] if start_epoch < switch_loss_on else self.loss_functions[1]
         self.optimizer = optimizer
         self.scheduler = scheduler
-
+        self.switch_loss_on = switch_loss_on
+        
         self.valid_loss = [None, None]
 
         self.max_n_epochs = max_n_epochs
+        self.steps_per_epoch = steps_per_epoch
         self.start_full_aug_on = start_full_aug_on if start_full_aug_on is not None else self.max_n_epochs
 
         self.current_epoch = start_epoch
+        self.current_step = 0 # fix later
         self.current_train_loss_avg = 0
         self.print_training_metrics_on_epoch = 1
 
@@ -52,7 +55,7 @@ class Segment:
 
         self.train_example = None
         self.valid_example = None
-        
+
         
             
     ### Training loop
@@ -62,43 +65,45 @@ class Segment:
         loss_avg = 0.0
         metrics = np.zeros((M))
         n_zeroFG = 0
-        
+
+        """
         if self.current_epoch < self.start_full_aug_on:
             augmentation = loader.dataset.base_augmentation
         else:
             augmentation = loader.dataset.full_augmentation
-
+        """
+        augmentation = loader.dataset.full_augmentation
         self.model.zero_grad()
         self.model.train()
         
         for X, y, idx in loader:
             X, y = augmentation(X.to(self.device), y.to(self.device))
-            
+
             self.optimizer.zero_grad()
             logits = self.model(X)
             loss = self.loss_fn(logits, y, gpu=True)
-                
+            
             loss_avg += loss.item()
             loss.backward()
             self.optimizer.step()
-
+            
             y_target = torch.argmax(y, dim=1)
             y_pred = torch.argmax(F.softmax(logits, dim=1), dim=1)
             if y_pred.max()==0:
                 n_zeroFG += 1
-            
+                
             if self.metrics_train is not None:
                 metrics = [metrics[m] + self.metrics_train[m](y_pred, y_target) for m in range(M)]
-            
-        if save_output and self.output_folder is not None:
-            output_folder_train = os.path.join(self.output_folder, "train_data",
-                                               "epoch_" + str(self.current_epoch).zfill(len(str(self.max_n_epochs))))
-            self._save_output(output_folder_train, loader.dataset, X, y_target, y_pred, idx)
-            
-        self.train_example = [X.cpu().detach().numpy().squeeze(),
-                              y_target.cpu().detach().numpy().squeeze(),
-                              y_pred.cpu().detach().numpy().squeeze(),
-                              logits.cpu().detach().numpy().squeeze()]
+                
+            """
+            if save_output and self.output_folder is not None:
+                output_folder_train = os.path.join(self.output_folder, "train_data",
+                                                    "epoch_" + str(self.current_epoch).zfill(len(str(self.max_n_epochs))))
+                self._save_output(output_folder_train, loader.dataset, X, y_target, y_pred, idx)
+            """
+            self.current_step += 1
+            if self.current_step % 100 == 0:
+                print(f'Epoch={self.current_epoch}, step={self.current_step}: loss={loss.item():>.4f}')
 
         self.current_train_loss_avg = loss_avg / N
         metrics = [metrics[m] / N for m in range(M)]
@@ -122,12 +127,12 @@ class Segment:
         M = len(self.metrics_valid)
         loss_avg = 0.0
         metrics = np.zeros((M))
-        
+
         if self.current_epoch < self.start_full_aug_on:
             augmentation = loader.dataset.base_augmentation
         else:
             augmentation = loader.dataset.base_augmentation
-            
+
         self.model.eval()
 
         for X, y, idx in loader:
@@ -204,7 +209,7 @@ class Segment:
                 f.write(f'{sid} {loss_idx:>.4f}')
                 for m in range(M):
                     f.write(f' {metrics_idx[m]:>.4f}')
-                    f.write(f'\n')
+                f.write(f'\n')
                 f.close()
 
 
@@ -212,18 +217,12 @@ class Segment:
     # Run at the end of each epoch
     def _epoch_end(self):
         # Print stuff
-        if self.current_epoch % self.print_training_metrics_on_epoch == 0:
-            print(f'Epoch={self.current_epoch} : loss={self.current_train_loss_avg:>.4f}, ' +
-                  f'lr={self.scheduler.get_last_lr()[0]:>.5f}')
+        #print(f'Epoch={self.current_epoch} : loss={self.current_train_loss_avg:>.4f}, ' +
+        #          f'lr={self.scheduler.get_last_lr()[0]:>.5f}')
 
         
         # Save model
         if self.model_output is not None:
-            torch.save({'epoch': self.current_epoch,
-                        'model_state': self.model.state_dict(),
-                        'optimizer_state': self.optimizer.state_dict(),
-                        'valid_loss': self.valid_loss[1]
-                        }, self.model_output + "_last")
             if self.valid_loss[0] is not None:
                 if self.valid_loss[1] < self.valid_loss[0]:
                     torch.save({'epoch': self.current_epoch,
@@ -231,12 +230,35 @@ class Segment:
                                 'optimizer_state': self.optimizer.state_dict(),
                                 'valid_loss': self.valid_loss[1]
                     }, self.model_output + "_best")
+            """
+            if (self.current_epoch + 1) % 100 == 0:
+                shutil.copyfile(self.model_output + "_best", self.model_output + "_best_epoch" + str(self.current_epoch + 1))
+            """
+            """
+            torch.save({'epoch': self.current_epoch,
+                        'model_state': self.model.state_dict(),
+                        'optimizer_state': self.optimizer.state_dict(),
+                        'valid_loss': self.valid_loss[1]
+                        }, self.model_output + "_last")
+            """
+            if (self.current_epoch + 1) == self.max_n_epochs:
+                torch.save({'epoch': self.current_epoch,
+                        'model_state': self.model.state_dict(),
+                        'optimizer_state': self.optimizer.state_dict(),
+                        'valid_loss': self.valid_loss[1]
+                        }, self.model_output + "_last")
+
 
         # Update/reset
         self.scheduler.step()
+        self.current_step = 0
         self.current_epoch += 1
         self.current_train_loss_avg = 0
-        
+
+        if self.current_epoch == self.switch_loss_on:
+            self.loss_fn = self.loss_functions[1]
+            print('Switching from', self.loss_functions[0].__name__, 'to', self.loss_functions[1].__name__, \
+                  'on epoch', self.current_epoch)
 
 
         
