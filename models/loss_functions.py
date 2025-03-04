@@ -48,7 +48,8 @@ def mean_dice_loss(output, target, weight=1, compute_softmax=True, exclude_backg
                          for i in range(start_idx, target.shape[1])])
     denom = torch.stack([torch.sum(output[:,i,...] + target[:,i,...]) + 1e-8 \
                          for i in range(start_idx, target.shape[1])])
-    loss = 1 - torch.mean(numer/denom)
+
+    loss = 1 - torch.mean(numer[denom!=0]/denom[denom!=0])
     return weight * loss
 
 
@@ -86,10 +87,12 @@ def mean_mse_loss_logits(output, target, weight=1, rescale_factor=15, exclude_ba
     start_idx = 1 if exclude_background else 0
     output_rescale = rescale_factor * (2 * (output - output.min())/ (output.max() - output.min()) - 1)
     target_rescale = rescale_factor * (2 * target - 1)
-    mse = torch.stack([((output_rescale[:,i,...] - target_rescale[:,i,...]) ** 2).sum() / \
-                       target[:,i,...].sum() for i in range(start_idx, target.shape[1])])
-    loss = torch.mean(mse)
-    
+
+    numer = torch.stack([((output_rescale[:,i,...] - target_rescale[:,i,...]) ** 2).sum() \
+                       for i in range(start_idx, target.shape[1])])
+    denom = torch.stack([target[:,i,...].sum() for i in range(start_idx, target.shape[1])])
+
+    loss = torch.mean(numer[denom!=0] / denom[denom!=0])
     return weight * loss
 
 

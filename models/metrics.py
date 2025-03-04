@@ -5,43 +5,31 @@ import numpy as np
 from scipy.ndimage import distance_transform_edt as edt
 
 
-def MeanDice(y_pred, y, exclude_zero=False):
-    if exclude_zero:
-        foreground_mask = (y_pred!=0) | (y!=0)
-        num = (y_pred[foreground_mask]==y[foreground_mask]).sum()
-        denom = 2 * foreground_mask.sum()
-    else:
-        num = (y_pred==y).sum()
-        denom = y.numel() + y_pred.numel()
-        
-    dice = 2 * num/denom
-    return dice.item()
 
-
-def MeanDice2(y_pred, y, exclude_zero=True):
-    if exclude_zero:
-        foreground_mask = (y_pred!=0) | (y!=0)
-        num = (y_pred[foreground_mask]==y[foreground_mask]).sum()
-        denom = 2 * foreground_mask.sum()
-    else:
-        num = (y_pred==y).sum()
-        denom = y.numel() + y_pred.numel()
-
-    dice = 2 * num/denom
-    return dice.item()
-
-
-
-def LabelDice(y_pred, y, label_list:list[int]=None):
-    labels = y.unique.numpy() if label_list is None else label_list
-    dice = np.zeros(labels.size, 1)
+def Dice(output, target, exclude_background=False, eps=1e-5, **kwargs):
+    start_idx = 1 if exclude_background else 0
+    output = torch.flatten(F.softmax(output[:, start_idx:, ...], dim=1) if compute_softmax \
+                           else output[:, start_idx:, ...])
+    target = torch.flatten(target[:, start_idx:, ...])
+    numer = 2 * torch.sum(output * target)
+    denom = torch.sum(output + target)
     
-    for i in range(labels):
-        num = ((y_pred==labels[i]) * (y==labels[i])).sum()
-        denom = (y_pred==labels[i]).sum() + (y==labels[i]).sum()
-        dice[i] = 2 * num / denom
+    dice = (numer + eps) / (denom + eps)
+    return dice
 
-    return dice.item()
+
+
+def MeanDice(output, target, exclude_background=False, eps=1e-5, **kwargs):
+    start_idx = 1 if exclude_background else 0
+    output = F.softmax(output, dim=1) if compute_softmax else output
+    numer = torch.stack([2 * torch.sum(output[:,i,...] * target[:,i,...]) \
+                         for i in range(start_idx, target.shape[1])])
+    denom = torch.stack([torch.sum(output[:,i,...] + target[:,i,...]) + 1e-8 \
+                         for i in range(start_idx, target.shape[1])])
+
+    dice = torch.mean((numer + eps) / (denom + eps))
+    breakpoint()
+    return dice
 
 
 

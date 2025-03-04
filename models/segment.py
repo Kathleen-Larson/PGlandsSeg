@@ -2,6 +2,7 @@ import os, time, shutil
 import pathlib as Path
 import numpy as np
 import freesurfer as fs
+import surfa as sf
 
 import torch
 import torch.optim
@@ -10,11 +11,13 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast
 
 
+
+
 class Segment:
-    def __init__(self, model, optimizer, scheduler, loss_functions:list, device,
+    def __init__(self,
+                 model, optimizer, scheduler, loss_functions:list, device,
                  output_folder, max_n_epochs, steps_per_epoch, start_epoch=0, start_full_aug_on=None,
-                 metrics_train=None, metrics_valid=None, metrics_test=None,
-                 use_multiple_optimizers=False, switch_loss_on:int=125, **kwargs):
+                 use_multiple_optimizers=False, switch_loss_on:int=5, **kwargs):
         super().__init__()
 
         self.device = device
@@ -33,13 +36,8 @@ class Segment:
         self.start_full_aug_on = start_full_aug_on if start_full_aug_on is not None else self.max_n_epochs
 
         self.current_epoch = start_epoch
-        self.current_step = 0 # fix later
+        self.current_step = 0
         self.current_train_loss_avg = 0
-        self.print_training_metrics_on_epoch = 1
-
-        self.metrics_train = metrics_train
-        self.metrics_valid = metrics_valid
-        self.metrics_test = metrics_test
 
         self.output_folder = output_folder
         if self.output_folder is not None:
@@ -53,204 +51,133 @@ class Segment:
             self.test_output = None
             self.model_output = None
 
-        self.train_example = None
-        self.valid_example = None
-
         
-            
     ### Training loop
-    def train(self, loader, save_output:bool=False):
+    def train(self, loader):
         N = len(loader.dataset)
-        M = len(self.metrics_train)
         loss_avg = 0.0
-        metrics = np.zeros((M))
-        n_zeroFG = 0
 
-        """
-        if self.current_epoch < self.start_full_aug_on:
-            augmentation = loader.dataset.base_augmentation
-        else:
-            augmentation = loader.dataset.full_augmentation
-        """
-        augmentation = loader.dataset.full_augmentation
-        self.model.zero_grad()
         self.model.train()
+        self.model.zero_grad()
         
-        for X, y, idx in loader:
-            X, y = augmentation(X.to(self.device), y.to(self.device))
-
-            self.optimizer.zero_grad()
+        for data, idx in loader:
+            X, y, template = loader.dataset.full_augmentations([x.to(self.device) for x in data])
             logits = self.model(X)
+
             loss = self.loss_fn(logits, y, gpu=True)
-            
             loss_avg += loss.item()
             loss.backward()
+
             self.optimizer.step()
-            
-            y_target = torch.argmax(y, dim=1)
-            y_pred = torch.argmax(F.softmax(logits, dim=1), dim=1)
-            if y_pred.max()==0:
-                n_zeroFG += 1
-                
-            if self.metrics_train is not None:
-                metrics = [metrics[m] + self.metrics_train[m](y_pred, y_target) for m in range(M)]
-                
-            """
-            if save_output and self.output_folder is not None:
-                output_folder_train = os.path.join(self.output_folder, "train_data",
-                                                    "epoch_" + str(self.current_epoch).zfill(len(str(self.max_n_epochs))))
-                self._save_output(output_folder_train, loader.dataset, X, y_target, y_pred, idx)
-            """
+            self.optimizer.zero_grad()
+
             self.current_step += 1
-            if self.current_step % 100 == 0:
+            self.current_train_loss_avg = loss_avg / self.current_step
+
+            if self.steps_per_epoch > 10:
+                if self.current_step % (self.steps_per_epoch // 10) == 0:
+                    print(f'Epoch={self.current_epoch}, step={self.current_step}: loss={loss.item():>.4f}')
+            else:
                 print(f'Epoch={self.current_epoch}, step={self.current_step}: loss={loss.item():>.4f}')
 
-        self.current_train_loss_avg = loss_avg / N
-        metrics = [metrics[m] / N for m in range(M)]
-
-        if n_zeroFG > 0:
-            print(f'predictions for {n_zeroFG}/{N} subjects contained 0 FG voxels')
-
+        self.current_train_loss_avg = loss_avg / self.steps_per_epoch
         if self.train_output is not None:
             f = open(self.train_output, 'a')
-            f.write(f'{self.current_epoch:5} {self.current_train_loss_avg:>9.4f} {self.scheduler.get_last_lr()[0]:>12.5f}')
-            for m in range(M):
-                f.write(f' {metrics[m]:>{len(self.metrics_train[m].__name__)}.5f}')
+            f.write(f'{self.current_epoch:5} {self.current_train_loss_avg:>9.4f}')
             f.write(f'\n')
-            f.close()
-            
+            f.close()            
+
 
             
     ### Validation loop
-    def validate(self, loader, save_output:bool=False):
+    def validate(self,
+                 loader,
+                 save_dir:str=None,
+                 save_output:bool=False,
+                 write_inputs=True,
+                 write_targets=False
+    ):
         N = len(loader.dataset)
-        M = len(self.metrics_valid)
-        loss_avg = 0.0
-        metrics = np.zeros((M))
-
-        if self.current_epoch < self.start_full_aug_on:
-            augmentation = loader.dataset.base_augmentation
-        else:
-            augmentation = loader.dataset.base_augmentation
-
+        loss_avg = 0.
+        
         self.model.eval()
-
-        for X, y, idx in loader:
-            X, y = augmentation(X.to(self.device), y.to(self.device))
-
+        self.model.zero_grad()
+        
+        for data, idx in loader:
+            X, y = loader.dataset.base_augmentations(data)
             with torch.no_grad():
-                self.optimizer.zero_grad()
                 logits = self.model(X)
-                loss = self.loss_fn(logits, y, gpu=True)
+            loss = self.loss_fn(logits, y, gpu=True)
 
             loss_avg += loss.item()
             y_target = torch.argmax(y, dim=1)
-            y_pred = torch.argmax(F.softmax(logits, dim=1), dim=1)
+            y_pred = torch.argmax(F.softmax(logits, dim=1), dim=1) 
             
-            if self.metrics_valid is not None:
-                metrics = [metrics[m] + self.metrics_valid[m](y_pred, y_target) for m in range(M)]
+            if save_output and self.output_folder is not None:
+                output_folder_valid = os.path.join(self.output_folder, "valid_data",
+                                                   "epoch_" + str(self.current_epoch + 1).zfill(len(str(self.max_n_epochs)))) \
+                                                   if save_dir is None else save_dir
 
-        if save_output and self.output_folder is not None:
-            output_folder_valid = os.path.join(self.output_folder, "valid_data",
-                                               "epoch_" + str(self.current_epoch).zfill(len(str(self.max_n_epochs))))
-            self._save_output(output_folder_valid, loader.dataset, X, y_target, y_pred, idx)
-            
+                self._save_output(output_folder_valid, loader.dataset, X, y_target, y_pred, idx,
+                                  write_targets=write_targets, write_inputs=write_inputs)
         loss_avg = loss_avg / N
-        self.valid_loss = [self.valid_loss[1], loss_avg]
-        self.valid_example = [X.cpu().detach().numpy(),
-                              y_target.cpu().detach().numpy(),
-                              y_pred.cpu().detach().numpy(),
-                              logits.cpu().detach().numpy()]
-
-        if self.metrics_valid is not None:  metrics = [metrics[m] / N for m in range(M)]
 
         if self.valid_output is not None:
             f = open(self.valid_output, 'a')
-            f.write(f'{self.current_epoch} {loss_avg:>.4f}')
-            for m in range(M):
-                f.write(f' {metrics[m]:>.5f}')
+            f.write(f'{self.current_epoch} {loss_avg:>9.4f}')
             f.write(f'\n')
             f.close()
-
         
 
     ### Testing loop
-    def test(self, loader, save_output:bool=False):
+    def test(self,
+             loader,
+             save_output:bool=False,
+             save_dir:str=None,
+             mode:str='train',
+             write_inputs:bool=True,
+             write_targets:bool=False,
+             write_posteriors:bool=True,
+             output_basename=None,
+    ):
+        save_dir = self.output_folder if save_dir is None else os.path.join(self.output_folder, save_dir)
+        
         N = len(loader.dataset)
-        M = len(self.metrics_test)
-
-        loss_idx = 0.0
-        metrics_idx = np.zeros((M, 1))
-        augmentation = loader.dataset.base_augmentation
-
         self.model.eval()
 
-        for X, y, idx in loader:
-            X, y = augmentation(X.to(self.device), y.to(self.device))
-            
+        for data, idx in loader:
+            if mode == 'predict':
+                X = loader.dataset.base_augmentations([x.to(self.device) for x in data])[0]
+                X = X[0] if isinstance(X, list) else X
+                y = None
+            else:
+                X, y = loader.dataset.base_augmentations([x.to(self.device) for x in data])[0:-1]
+
             with torch.no_grad():
                 logits = self.model(X)
-                loss = self.loss_fn(logits, y, gpu=True)
-                loss_idx = loss.item()
+            posteriors = F.softmax(logits, dim=1)
 
-            y_target = torch.argmax(y, dim=1)
-            y_pred = torch.argmax(F.softmax(logits, dim=1), dim=1)
-
-            if self.metrics_test is not None:
-                metrics_idx = [self.metrics_test[m](y_pred, y_target) for m in range(M)]
-
-            if save_output and self.output_folder is not None:
-                self._save_output(os.path.join(self.output_folder, "test_data"),
-                                  loader.dataset, X, y_target, y_pred, idx)
-        
-            if save_output and self.test_output is not None:
-                sid = "".join(loader.dataset.label_files[idx].split("/")[-1].split(".")[0:2])[3:]
-                f = open(self.test_output, 'a')
-                f.write(f'{sid} {loss_idx:>.4f}')
-                for m in range(M):
-                    f.write(f' {metrics_idx[m]:>.4f}')
-                f.write(f'\n')
-                f.close()
-
+            if save_output:
+                self._save_output(save_dir, loader.dataset,
+                                  X, y, posteriors, idx,
+                                  output_basename=output_basename,
+                                  write_inputs=write_inputs,
+                                  write_targets=write_targets,
+                                  write_posteriors=write_posteriors)
 
                 
     # Run at the end of each epoch
-    def _epoch_end(self):
-        # Print stuff
-        #print(f'Epoch={self.current_epoch} : loss={self.current_train_loss_avg:>.4f}, ' +
-        #          f'lr={self.scheduler.get_last_lr()[0]:>.5f}')
-
-        
+    def _epoch_end(self, output_model:bool=False):
         # Save model
-        if self.model_output is not None:
-            if self.valid_loss[0] is not None:
-                if self.valid_loss[1] < self.valid_loss[0]:
-                    torch.save({'epoch': self.current_epoch,
-                                'model_state': self.model.state_dict(),
-                                'optimizer_state': self.optimizer.state_dict(),
-                                'valid_loss': self.valid_loss[1]
-                    }, self.model_output + "_best")
-            """
-            if (self.current_epoch + 1) % 100 == 0:
-                shutil.copyfile(self.model_output + "_best", self.model_output + "_best_epoch" + str(self.current_epoch + 1))
-            """
-            """
-            torch.save({'epoch': self.current_epoch,
+        save_model_every_epoch = 20
+        save_model = (self.current_epoch + 1) % 20 == 0
+        if self.model_output is not None and save_model:
+            torch.save({'epoch': self.current_epoch + 1,
                         'model_state': self.model.state_dict(),
                         'optimizer_state': self.optimizer.state_dict(),
-                        'valid_loss': self.valid_loss[1]
-                        }, self.model_output + "_last")
-            """
-            if (self.current_epoch + 1) == self.max_n_epochs:
-                torch.save({'epoch': self.current_epoch,
-                        'model_state': self.model.state_dict(),
-                        'optimizer_state': self.optimizer.state_dict(),
-                        'valid_loss': self.valid_loss[1]
-                        }, self.model_output + "_last")
-
-
+            }, self.model_output + "_last.tar")        
+        
         # Update/reset
-        self.scheduler.step()
         self.current_step = 0
         self.current_epoch += 1
         self.current_train_loss_avg = 0
@@ -258,22 +185,54 @@ class Segment:
         if self.current_epoch == self.switch_loss_on:
             self.loss_fn = self.loss_functions[1]
             print('Switching from', self.loss_functions[0].__name__, 'to', self.loss_functions[1].__name__, \
-                  'on epoch', self.current_epoch)
+                  'after ', self.current_epoch, ' epochs')
 
 
         
     ### Function to write image data
-    def _save_output(self, folder, dataset, inputs, target, output, idx):
+    def _save_output(self, folder, dataset, inputs, target, output, idx,
+                     output_basename=None, crop_type='bbox', conform2orig=True,
+                     write_inputs=False, write_targets=False, write_posteriors=False):
+        
         if folder is not None:
-            basename = dataset.label_files[idx].split("/")[-1].split(".")[0:2]
+            if output_basename is not None:
+                basename = [output_basename] if not isinstance(output_basename, list) \
+                    else output_basename
+
+            elif target is not None:
+                basename = dataset.label_files[idx].split("/")[-1].split(".")[0]
+                basename = [basename] if not isinstance(basename, list) else basename
+
+            else:
+                basename = dataset.image_files[idx][0].split("/")[-1].split(".")[0].split("_")[:-1]
+                basename = [basename] if not isinstance(basename, list) else basename
+                
             if not os.path.exists(folder):
                 os.makedirs(folder, exist_ok=True)
 
-            for i in range(len(dataset.image_files[idx])):
-                input_str = dataset.image_files[idx][i].split(".")[-2:]
-                input_path = os.path.join(folder, ".".join(basename) + "." + ".".join(input_str))
-                dataset._save_output(inputs[:, i, ...], input_path, dtype=np.float32)
-            target_path = os.path.join(folder, ".".join(basename) + ".target.mgz")
-            dataset._save_output(target, target_path, dtype=np.int32, is_onehot=False)
-            output_path = os.path.join(folder, ".".join(basename) + ".output.mgz")
-            dataset._save_output(output, output_path, dtype=np.int32, is_onehot=False)
+            if write_posteriors:
+                posterior = sf.Volume(np.squeeze(output.cpu().numpy()))
+                posterior_path = os.path.join(folder, "_".join(basename + ["posterior.mgz"]))
+                posterior.save(posterior_path)
+
+
+            output_segmentation = torch.argmax(output, dim=1)
+            output_path = os.path.join(folder, "_".join(basename + ["prediction.mgz"]))
+            dataset._save_output(output_segmentation,
+                                 output_path, idx, geom_idx=0, dtype=np.int32, crop_type=crop_type,
+                                 conform2orig=conform2orig, is_labels=True, convert_labels=True)                
+                
+            if write_targets and target is not None:
+                target_segmentation = torch.argmax(target, dim=1)
+                target_path = os.path.join(folder, "_".join(basename + ["target.mgz"]))
+                dataset._save_output(target_segmentation,
+                                     target_path, idx, geom_idx=0, dtype=np.int32, crop_type=crop_type,
+                                     conform2orig=conform2orig, is_labels=True, convert_labels=True)
+            
+            if write_inputs:
+                for i in range(len(dataset.image_files[idx])):
+                    input_str = dataset.image_files[idx][i].split("/")[-1].split(".")[0]
+                    input_path = os.path.join(folder, "_".join([input_str, "input.mgz"]))                    
+                    dataset._save_output(inputs[:, i, ...], input_path, idx, geom_idx=i, \
+                                         dtype=np.float32, conform2orig=conform2orig)
+
