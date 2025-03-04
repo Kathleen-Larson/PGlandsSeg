@@ -1,4 +1,4 @@
-import os, warnings, argparse, logging, random
+import os, warnings, argparse, logging, random, time
 from os import system
 import numpy as np
 import nibabel as nib
@@ -9,8 +9,8 @@ import torch.nn as nn
 import torch.optim
 from torch.utils.data import DataLoader, RandomSampler
 
-from data_utils.pituitarypineal_train import call_dataset
-from data_utils import transforms as t
+from data_utils.dataloader_pseg import call_dataset
+from models import augmentations as aug
 
 import options
 import models
@@ -33,9 +33,16 @@ def _set_seed(seed):
 
 
 
-def _setup_log(file, str):
-    f = open(file, 'w')
-    f.write(str + '\n')
+def _setup_log(filename, string):
+    f = open(filename, 'w')
+    f.write(string + '\n')
+    f.close()
+
+
+def _write_data_ids_log(filename, dataset):
+    id_list = set([dataset.image_files[i][0].split('/')[-1].split('.')[0] for i in range(len(dataset.image_files))])
+    f = open(filename, 'w')
+    for subject_id in sorted(id_list): f.write(subject_id + '\n')
     f.close()
     
 
@@ -51,7 +58,6 @@ def _config_optimizer(config, network_params):
                                                       weight_decay=config.weight_decay
         )
     elif optimizerID=="SGD":
-        momentum = config.momentum
         optimizer = torch.optim.__dict__[optimizerID](params=network_params,
                                                       lr=config.lr_start,
                                                       momentum=config.momentum,
@@ -75,7 +81,7 @@ def _config_lr_scheduler(config, optimizer):
         )
     elif schedulerID=="StepLR":
         scheduler = torch.optim.lr_scheduler.__dict__[schedulerID](optimizer,
-                                                                   step_size=5,
+                                                                   step_size=config.max_n_epochs,
         )
     elif schedulerID=="PolynomialLR":
         scheduler = torch.optim.lr_scheduler.__dict__[schedulerID](optimizer,
@@ -120,25 +126,61 @@ def _dataloader_random_sample(pargs, dataset):
 def main(pargs):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.set_float32_matmul_precision('medium')
-    
+
     
     ### Data set-up ###
-    aug_config = pargs.aug_config
-    data_config = pargs.data_config
+    input_data_files = pargs.input_data_files
+    data_inds_config = pargs.data_inds_config
+    n_data_splits = pargs.n_data_splits
 
-    train_data, valid_data, test_data = call_dataset(data_config=data_config,
-                                                     aug_config=aug_config,
-                                                     crop_patch_size=(160, 160, 160),
-                                                     prob_lr_flip=0.5,
-    )
-    train_loader = _dataloader_random_sample(pargs, train_data)
-    valid_loader = _dataloader_random_sample(pargs, valid_data)
-    test_loader = _dataloader_random_sample(pargs, test_data)
+    aug_config = pargs.aug_config
+    crop_patch_size = pargs.crop_patch_size
+    use_crop_template = bool(pargs.use_crop_template)
+
+    segment_pituitary = pargs.segment_pituitary
+    segment_pineal = pargs.segment_pineal
+    apply_postpit_aug = pargs.apply_postpit_aug if segment_pituitary else False
+    apply_pineal_aug = pargs.apply_pineal_aug if segment_pineal else False
+    apply_robust_normalization = pargs.apply_robust_normalization
     
+    datasets = call_dataset(input_data_files=input_data_files,
+                            aug_config=aug_config,
+                            data_inds_config=data_inds_config,
+                            n_data_splits=n_data_splits,
+                            crop_patch_size=crop_patch_size,
+                            use_crop_template=use_crop_template,
+                            segment_pituitary=segment_pituitary,
+                            segment_pineal=segment_pineal,
+                            apply_postpit_aug=apply_postpit_aug,
+                            apply_pineal_aug=apply_pineal_aug,
+                            apply_robust_normalization=apply_robust_normalization,
+                            device=device
+    )
+    train_data = datasets[0]
+    test_data = datasets[-1] if n_data_splits > 1 else None
+    valid_data = datasets[-2] if n_data_splits > 2 else None
+
+    batch_size = pargs.batch_size
+    n_workers = pargs.n_workers
+    train_loader = _dataloader_random_sample(pargs, train_data)
+    test_loader = None if test_data is None else \
+        DataLoader(test_data, batch_size=batch_size, num_workers=n_workers, shuffle=True)
+    valid_loader = None if valid_data is None else \
+        DataLoader(valid_data, batch_size=batch_size, num_workers=n_workers, shuffle=True)
+
     
     ### Model set-up ###
+    activation_function = pargs.activation_function
+    conv_window_size = pargs.conv_window_size
+    pool_window_size = pargs.pool_window_size
+    use_residuals = bool(pargs.use_residuals)
+    
     network = models.unet.__dict__[pargs.network](in_channels=train_data.__numinput__(),
                                                   out_channels=train_data.__numclass__(),
+                                                  activation_function=activation_function,
+                                                  conv_window_size=conv_window_size,
+                                                  pool_window_size=pool_window_size,
+                                                  residuals=use_residuals
     ).to(device)
     loss_fns = [loss_functions.__dict__[loss_fn] for loss_fn in pargs.loss_fns]
     optimizers = [_config_optimizer(pargs, network.parameters()) for i in range(len(loss_fns))]
@@ -147,36 +189,21 @@ def main(pargs):
     
     ### Load pre-trained model parameters ###
     train_checkpoint_path = pargs.model_state_path
-    pretrain_model_path = pargs.pretrain_model_path
-    if train_checkpoint_path is None:
-        if pretrain_model_path is not None:
-            pretrain_model = torch.load(pretrain_model_path)
-            network.load_state_dict(pretrain_model["model_state"])
-            #optimizers[0].load_state_dict(pretrained_checkpoint['optimizer_state'])
-    else:
+    if train_checkpoint_path is not None and os.path.isfile(train_checkpoint_path):
         train_checkpoint = torch.load(train_checkpoint_path)
         network.load_state_dict(train_checkpoint["model_state"])
         optimizers[0].load_state_dict(train_checkpoint["optimizer_state"])
-
-
-    ## Metrics set-up ###
-    metrics_train = [models.metrics.__dict__[pargs.metrics_train[i]] \
-                     for i in range(len(pargs.metrics_train))]
-    metrics_test = [models.metrics.__dict__[pargs.metrics_test[i]] \
-                    for i in range(len(pargs.metrics_test))]
-    metrics_valid = [models.metrics.__dict__[pargs.metrics_valid[i]] \
-                     for i in range(len(pargs.metrics_valid))]
-
+    else:
+        train_checkpoint = None
+        
 
     ### Parse everything into trainer ###
     output_folder = pargs.output_dir
-    start_epoch = 0 if train_checkpoint_path is None else train_checkpoint["epoch"]
+    start_epoch = 0 if train_checkpoint is None else train_checkpoint["epoch"]
     steps_per_epoch = pargs.steps_per_epoch
     max_n_epochs = pargs.max_n_epochs
     start_aug_on = pargs.start_aug_on if pargs.start_aug_on is not None else max_n_epochs
     switch_loss_on = pargs.switch_loss_on
-    save_train_output_every=1
-    save_valid_output_every=1
     
     trainer = segment(model=network,
                       optimizer=optimizers[0],
@@ -188,58 +215,74 @@ def main(pargs):
                       steps_per_epoch=steps_per_epoch,
                       switch_loss_on=switch_loss_on,
                       output_folder=output_folder,
+                      use_crop_template=use_crop_template,
                       device=device,
-                      metrics_train=metrics_train,
-                      metrics_valid=metrics_valid,
-                      metrics_test=metrics_test
     )
-    
 
+    
     ### Logging set-up ###
     if output_folder is not None and train_checkpoint_path is None:
         if not os.path.exists(output_folder):  os.mkdir(output_folder)
-        _setup_log(os.path.join(output_folder, "training_log.txt"), "Epoch TrainLoss LearningRate " + \
-                   " ".join(pargs.metrics_train[i] for i in range(len(pargs.metrics_train))))
-        _setup_log(os.path.join(output_folder, "validation_log.txt"), "Epoch Loss " + \
-                   " ".join(pargs.metrics_valid[i] for i in range(len(pargs.metrics_valid))))
-        _setup_log(os.path.join(output_folder, "testing_log.txt"), "ImgID Loss " + \
-                   " ".join(pargs.metrics_test[i] for i in range(len(pargs.metrics_test))))
-        
+
+        _write_data_ids_log(os.path.join(output_folder, "train_data_ids_log.txt"), train_data)
+        _setup_log(os.path.join(output_folder, "training_log.txt"), "Epoch  TrainLoss")
+
+        if valid_data is not None:
+            _write_data_ids_log(os.path.join(output_folder, "valid_data_ids_log.txt"), valid_data)
+            _setup_log(os.path.join(output_folder, "validation_log.txt"), "Epoch  ValidLoss")
+
+        if test_data is not None:
+            _write_data_ids_log(os.path.join(output_folder, "test_data_ids_log.txt"), test_data)
+
         param_output_file=os.path.join(output_folder, "training_params.txt")
         f = open(param_output_file, 'w')
-        
-        f.write('--------------------------------------\n')
-        f.write('Full data augmentation set:\n')        
-        f.write('--------------------------------------\n')
-        for t in train_data.full_augmentation.transforms:
-            f.write(f'{t.__class__.__name__}:\n')
-            for k in t.__dict__:
-                if k != 'X':  f.write(f'    {k}={t.__dict__[k]}\n')
-        f.write('\n')
-        
+        if aug_config is not None:
+            f.write('--------------------------------------\n')
+            f.write('Full data augmentation set:\n')        
+            f.write('--------------------------------------\n')
+            
+            f.write(f'Augmentations:\n')
+            for T in train_data.full_augmentations.transforms:
+                f.write(f'{T.__class__.__name__}:')
+                for k in T.__dict__:
+                    if k == '_get_bounds': f.write(f'{k}={T.__dict__[k].__name__}\n')
+                    elif k != 'X': f.write(f'{k}={T.__dict__[k]}\n')
+                f.write('\n')
+            f.write('\n')
+            
         f.write('--------------------------------------\n')
         f.write('Training parameters:\n')
         f.write('--------------------------------------\n')
         for k in pargs.__dict__:
             f.write(f'{k}={pargs.__dict__[k]}\n')
-        f.write('\n')
-        
+        f.write('\n')        
         f.close()
+        
         with open(param_output_file, 'r') as f:
             print(f.read())
-        
-                
+        f.close()
+            
+
     ### Run ###
     print('--------------------------------------')
-    print("Train: %d | Valid: %d | Tests: %d" % \
-          (len(train_loader.dataset), len(valid_loader.dataset), len(test_loader.dataset)))
+    if valid_data is not None and test_data is not None:
+        print('Train: %d | Valid: %d | Tests: %d' % (len(train_data), len(valid_data), len(test_data)))
+    elif test_data is not None and valid_data is None:
+         print('Train: %d | Tests: %d' % (len(train_data), len(test_data)))
+    else:
+        print('Train: %d' % (len(train_data)))
     print('--------------------------------------')
-
+    
     for epoch in range(start_epoch, max_n_epochs):
-        trainer.train(loader=train_loader, save_output=False)
-        trainer.validate(loader=valid_loader, save_output=False)
+        trainer.train(loader=train_loader)
+        if valid_loader is not None:
+            trainer.validate(loader=valid_loader, save_output=False)
         trainer._epoch_end()
-    trainer.test(loader=test_loader, save_output=True)
+    
+    """
+    if test_loader is not None:
+        trainer.test(loader=test_loader, save_output=True, write_inputs=True, write_targets=True)
+    """
     
     
 

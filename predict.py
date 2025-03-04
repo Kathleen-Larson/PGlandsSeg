@@ -1,8 +1,9 @@
-import os, warnings, argparse, logging, random
+import os, warnings, argparse, logging, random, csv
 from os import system
 import numpy as np
 import nibabel as nib
 import freesurfer as fs
+import surfa as sf
 
 import torch
 import torch.nn as nn
@@ -10,12 +11,15 @@ import torch.nn.functional as F
 import torch.optim
 from torch.utils.data import DataLoader
 
-from data_utils.pituitarypineal_predict import call_dataset
-from data_utils import transforms_singleinput as t
+from scipy import ndimage
 
 import options
 import models
-from models import unet, metrics
+from models import unet, loss_functions
+from models.segment import Segment as segment
+import models.augmentations as aug
+
+from data_utils.dataloader_pseg import call_dataset
 
 
 
@@ -32,11 +36,64 @@ def _set_seed(seed):
 
 
 
-def _setup_log(file, str):
-    f = open(file, 'w')
-    f.write(str + '\n')
-    f.close()
+def _convert_labels(self, img, labels=(0, 883, 900, 903, 904)):
+    img_convert = img.copy()
+    for i in range(len(labels)):
+        img_convert[img==i] = labels[i]
+        
+    return img_convert
     
+    
+
+def _config_optimizer(config, network_params):
+    optimizerID = config.optimizer
+
+    if optimizerID=="Adam" or optimizerID=="AdamW":
+        betas = (config.beta1, config.beta2)
+        optimizer = torch.optim.__dict__[optimizerID](params=network_params,
+                                                      betas=(config.beta1, config.beta2),
+                                                      lr=config.lr_start,
+                                                      weight_decay=config.weight_decay
+        )
+    elif optimizerID=="SGD":
+        optimizer = torch.optim.__dict__[optimizerID](params=network_params,
+                                                      lr=config.lr_start,
+                                                      momentum=config.momentum,
+                                                      weight_decay=config.weight_decay,
+                                                      dampening=config.dampening
+        )
+    else:
+        raise Exception('invalid optimizer')
+
+    return optimizer
+
+
+def _config_lr_scheduler(config, optimizer):
+    schedulerID = config.lr_scheduler
+
+    if schedulerID=="ConstantLR":
+        scheduler = torch.optim.lr_scheduler.__dict__[schedulerID](optimizer,
+                                                                   factor=config.lr_param,
+                                                                   total_iters=config.max_n_epochs,
+        )
+    elif schedulerID=="StepLR":
+        scheduler = torch.optim.lr_scheduler.__dict__[schedulerID](optimizer,
+                                                                   step_size=config.max_n_epochs,
+        )
+    elif schedulerID=="PolynomialLR":
+        scheduler = torch.optim.lr_scheduler.__dict__[schedulerID](optimizer,
+                                                                   total_iters=config.max_n_epochs,
+                                                                   power=config.lr_param
+        )
+    elif schedulerID=="ExponentialLR":
+        scheduler = torch.optim.lr_scheduler.__dict__[schedulerID](optimizer,
+                                                                   gamma=config.lr_param
+        )
+    else:
+        raise Exception("invalid lr_scheduler")
+
+    return scheduler
+
 
 
 def _config():
@@ -46,8 +103,8 @@ def _config():
 
     seed = pargs.seed
     _set_seed(seed)
-
     return pargs
+
 
 
 def _predict(x, model):
@@ -57,61 +114,84 @@ def _predict(x, model):
 
         
 
-
 def main(pargs):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     torch.set_float32_matmul_precision('medium')
-    
-    ### Data set-up ###
-    batch_size = pargs.batch_size
-    data_config = pargs.data_config
-    n_workers = pargs.n_workers
 
-    data = call_dataset(data_config=data_config, crop_patch_size=(160, 160, 160))
-    DL = DataLoader(data, batch_size=batch_size, shuffle=False, num_workers=n_workers)
+    mode = 'predict'
+
     
-    ### Model set-up ###
-    model = models.unet.__dict__[pargs.network](in_channels=data.__numinput__(),
-                                                  out_channels=data.__numclass__(),
+    ## Initialize data
+    aug_config = pargs.aug_config
+    input_data_files = pargs.input_data_files
+    crop_patch_size = pargs.crop_patch_size
+    use_crop_template = bool(pargs.use_crop_template)
+
+    segment_pituitary = pargs.segment_pituitary
+    segment_pineal = pargs.segment_pineal
+    
+    dataset = call_dataset(input_data_files=input_data_files,
+                           aug_config=None,
+                           crop_patch_size=crop_patch_size,
+                           use_crop_template=use_crop_template,
+                           segment_pituitary=segment_pituitary,
+                           segment_pineal=segment_pineal,
+                           has_ground_truth=True if mode == 'train' else False,
+                           device=device,
+    )[0]
+    loader = DataLoader(dataset, batch_size=1, num_workers=8, shuffle=False)
+
+    ## Model set-up
+    network = models.unet.__dict__[pargs.network](in_channels=dataset.__numinput__(),
+                                                  out_channels=dataset.__numclass__(),
     ).to(device)
-
-    model_state_path = pargs.model_state_path
-    if model_state_path is not None:
-        trained_model = torch.load(model_state_path)
-        model.load_state_dict(trained_model["model_state"])
-    else:
+    loss_fns = [loss_functions.__dict__[loss_fn] for loss_fn in pargs.loss_fns]
+    optimizers = [_config_optimizer(pargs, network.parameters()) for i in range(len(loss_fns))]
+    lr_schedulers = [_config_lr_scheduler(pargs, optim) for optim in optimizers]
+    
+    
+    ### Load pre-trained model parameters ###
+    train_checkpoint_path = pargs.model_state_path
+    if train_checkpoint_path is None:
         raise Exception('model_state_path must be provided')
+    else:
+        train_checkpoint = torch.load(train_checkpoint_path)
+        network.load_state_dict(train_checkpoint["model_state"])
+        optimizers[0].load_state_dict(train_checkpoint["optimizer_state"])
+        model_epoch = train_checkpoint["epoch"]
 
-    
-    ## Predict label maps for input dataset
-    output_dir = pargs.output_dir
-
-    model.eval()
-    for X, idx in DL:
-        # Do the predictions
-        X = DL.dataset.augmentation(X.cuda())
-        while len(X.shape) < 5: # idk WHY this is necessary and it's so annoying
-            X = torch.unsqueeze(X, dim=0)
-
-        with torch.no_grad():
-            logits = model(X)
-        y = torch.argmax(F.softmax(logits, dim=1), dim=1)
-        breakpoint()
         
-        # Write out the data
-        basename = DL.dataset.image_files[idx][0].split("/")[-1].split(".")[0]
-        for i in range(len(DL.dataset.image_files[idx])):
-            input_path = os.path.join(output_dir, basename + "_input.mgz")
-            DL.dataset._save_output(X[:, i, ...], input_path, dtype=np.float32)
-
-        output_path = os.path.join(output_dir, basename + "_prediction.mgz")
-        DL.dataset._save_output(y, output_path, dtype=np.int32)
-        breakpoint()
-
-
+    ### Parse everything into trainer and run
+    output_folder = pargs.output_dir
+    start_epoch = 0 if train_checkpoint_path is None else train_checkpoint["epoch"]
+    steps_per_epoch = pargs.steps_per_epoch
+    max_n_epochs = pargs.max_n_epochs
+    start_aug_on = pargs.start_aug_on if pargs.start_aug_on is not None else max_n_epochs
+    switch_loss_on = 0
     
-    
+    trainer = segment(model=network,
+                      optimizer=optimizers[0],
+                      scheduler=lr_schedulers[0],
+                      loss_functions=loss_fns,
+                      start_epoch=start_epoch,
+                      max_n_epochs=max_n_epochs,
+                      start_full_aug_on=0,
+                      steps_per_epoch=steps_per_epoch,
+                      switch_loss_on=switch_loss_on,
+                      output_folder=output_folder,
+                      device=device,
+    )
 
+    save_dir = '_'.join(['model_outputs__epoch', str(model_epoch)])
+    trainer.test(loader=loader,
+                 save_dir=save_dir,
+                 mode=mode,
+                 save_output=True,
+                 write_inputs=False,
+                 write_targets=True,
+                 write_posteriors=False)
+    
+            
 ##########################
 if __name__ == "__main__":
     main(_config())
