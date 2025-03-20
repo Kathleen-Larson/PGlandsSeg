@@ -1,4 +1,0 @@
-optimizer=AdamW
-LR=0.0005
-weight_decay=0.00001
-momentum=0
