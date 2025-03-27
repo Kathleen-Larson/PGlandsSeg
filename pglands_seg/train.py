@@ -8,23 +8,18 @@ import random
 import time
 import yaml
 import numpy as np
+import surfa as sf
 
 import torch
 import torch.nn as nn
 import torch.optim
 from torch.utils.data import DataLoader, RandomSampler
 
-import surfa as sf
-
-from pglands_dataset import _config_datasets
-from models import augmentations as aug
-
-import options
-import utils
-import models
-from models.unet import UNet3D
-import models.loss_functions as loss_functions
+from . import loss_functions utils
+import augmentations as aug
+from dataset import _config_datasets
 from segmenter import PGlandsSegmenter
+from unet import UNet3D
 
 #------------------------------------------------------------------------------
 
