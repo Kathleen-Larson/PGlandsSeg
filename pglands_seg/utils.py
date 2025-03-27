@@ -28,12 +28,9 @@ def parse_args():
     parser.add_argument('-config', '--config', default='configs/train.yaml',
                         help='.yaml file path to configure all parameters; '
                         'default is configs/train.yaml')
-    parser.add_argument('-cpu_only', '--cpu_only', action='store_true',
-                        help='Flag to use only cpu (no gpu assistance)')
-    parser.add_argument('-i', '--i',
-                        help='csv file listing filenames of input data')
-    parser.add_argument('-predict', '--predict', action='store_true',
-                        help='Flag to run inference only (no training)')
+    parser.add_argument('-use_cuda', '--use_cuda', action='store_true',
+                        help='Flag to use cuda for  gpu assistance (will '
+                        'use only cpu if not specified')
     parser.add_argument('-resume', '--resume', action='store_true',
                         help='Flag to resume training from model checkpoint')
     return parser.parse_args()

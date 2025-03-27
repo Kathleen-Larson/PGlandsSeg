@@ -29,20 +29,18 @@ from segmenter import PGlandsSegmenter
 #------------------------------------------------------------------------------
 
 def main(pargs):
-    # Load config file
+    # Parse commandline args
+    use_cuda = pargs.use_cuda
+    resume_training = pargs.resume
+    
     if not 'config' in sys.argv:
         print('No .yaml config file supplied, using default '
               'configs/train.yaml')
     config = yaml.safe_load(open(pargs.config))
-
-    # Parse other commandline args
-    cpu_only = pargs.cpu_only
-    infer_only = pargs.predict
-    resume_training = pargs.resume
     
     # Set up device
     device = 'cpu'
-    if not cpu_only:
+    if use_cuda:
         if torch.cuda.is_available():
             device = torch.device('cuda')
         else:
@@ -59,7 +57,7 @@ def main(pargs):
     datasets = _config_datasets(data_config=config['dataset'],
                                 aug_config=config['augmentations'],
                                 log_dir=config['training']['output_dir'],
-                                infer_only=infer_only,
+                                infer_only=False,
                                 device=device,
     )
     if 'train' in datasets:
@@ -91,7 +89,7 @@ def main(pargs):
     segmenter = PGlandsSegmenter(model=network,
                                  optimizer=optimizer,
                                  resume=resume_training,
-                                 infer_only=infer_only,
+                                 infer_only=False,
                                  device=device,
                                  n_train_samples=n_train_samples,
                                  **config['training']
@@ -107,16 +105,15 @@ def main(pargs):
     print(f'{bffr}\n {fstr}\n{bffr}')
 
     # Run training
-    if not infer_only:
-        for epoch in range(segmenter.start_epoch, segmenter.max_n_epochs):
-            if not 'train' in loaders:
-                utils.fatal('No train loader exists... something went wrong')
-            segmenter._train(loader=loaders['train'])
+    for epoch in range(segmenter.start_epoch, segmenter.max_n_epochs):
+        if not 'train' in loaders:
+            utils.fatal('No train loader exists... something went wrong')
+        segmenter._train(loader=loaders['train'])
+        
+        if 'valid' in loaders:
+            segmenter._predict(loader=loaders['valid'], loss_type='valid')
             
-            if 'valid' in loaders:
-                segmenter._predict(loader=loaders['valid'], loss_type='valid')
-
-        segmenter._epoch_end()
+    segmenter._epoch_end()
 
     # Run inference
     if 'test' in loaders:

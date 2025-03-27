@@ -29,20 +29,18 @@ from segmenter import PGlandsSegmenter
 #------------------------------------------------------------------------------
 
 def main(pargs):
-    # Load config file
+    # Parse commandline args
+    use_cuda = pargs.use_cuda
+    resume_training = pargs.resume
+
     if not 'config' in sys.argv:
         print('No .yaml config file supplied, using default '
               'configs/train.yaml')
     config = yaml.safe_load(open(pargs.config))
 
-    # Parse other commandline args
-    cpu_only = pargs.cpu_only
-    infer_only = True
-    resume_training = pargs.resume
-    
     # Set up device
     device = 'cpu'
-    if not cpu_only:
+    if use_cuda:
         if torch.cuda.is_available():
             device = torch.device('cuda')
         else:
