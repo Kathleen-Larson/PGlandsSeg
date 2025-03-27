@@ -1,0 +1,104 @@
+seed: 0
+
+augmentations:
+  full:
+    AffineElasticTransform:
+      apply_affine: true
+      apply_elastic: true
+      elastic_factor: 0.0625
+      elastic_std: 3.0
+      n_elastic_steps: 7
+      randomize: true
+      rotations:
+      - -15.0
+      - 15.0
+      scales:
+      - -0.15
+      - 0.15
+      shears:
+      - -0.012
+      - 0.12
+      translations:
+      - 0.0
+      - 0.0
+    BiasField:
+      max_value: 1.0
+      randomize: True
+      shape_factor: 0.025
+      std: 0.3
+    CropPatch:
+      center_crop: false
+      patch_sz: 96
+      randomize: true
+    FlipTransform:
+      chance: 0.5
+      flip_axis: 2
+    GammaTransform:
+      randomize: true
+      std: 0.5
+    GaussianNoise:
+      randomize: true
+      std: 21.0
+    MinMaxNorm:
+      m: 0.0
+      M: 1.0
+      min_perc: 0.0
+      max_perc: 0.95
+      use_robust: true
+  partial:
+    CropPatch:
+      center_crop: false
+      patch_sz: 96
+      randomize: false
+    MinMaxNorm:
+      m: 0.0
+      M: 1.0
+      min_perc: 0.0
+      max_perc: 0.95
+      use_robust: true
+
+dataloader:
+  batch_size: 1
+  num_workers: 8
+  pin_memory: true
+
+dataset:
+  input_data_config: configs/input_data_config.csv
+  lut: 'pglands.min.ctab'
+  n_splits: 3
+  randomize: false
+
+network:
+  activ_func: torch.nn.ELU
+  conv_sz: 3
+  drop_rate: 0
+  n_convs_per_block: 2
+  n_levels: 4
+  n_starting_features: 24
+  norm_func: torch.nn.InstanceNorm
+  pool_func: torch.nn.MaxPool
+  pool_sz: 2
+  use_residuals: false
+  use_skips: true
+
+optimizer:
+  _class: torch.optim.Adam
+  betas:
+  - 0.9
+  - 0.99
+  decay: 0.000001
+  lr_start: 0.0001
+  weight_decay: 0.000001
+
+training:
+  checkpoint_path:
+  loss_funcs:
+  - models.loss_functions.mean_mse_loss_logits_yesbackground
+  - models.loss_functions.mean_dice_loss_yesbackground
+  max_n_epochs: 200
+  max_n_steps:
+  output_dir: data/test
+  save_outputs_every: 0
+  start_aug_on: 0  
+  steps_per_epoch: 2000
+  switch_loss_on: 5
