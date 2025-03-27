@@ -5,29 +5,10 @@ If you're using Conda to maintain your python environment, use the following ste
 1. conda create --name {name of your env} --file requirements.txt
 2. conda actiavte {name of your env}
 
-
-If you're using Poetry instead, use these steps:
-1. poetry install
-2. poetry shell
-3. python run train.py
-
-
-## Here is the general workflow and contents of each file:
-
-Main scripts:
-   - segment__*.sh : use to define input parameters and run through slurm as a job array
-   - train.py : parses all input parameters (or default values), sets up and runs the training pipeline
-
-W/in models/:
-     - segment.py : contains the training, validation, and testing loops (data augmentation performed here)
-     - loss_functions.py : contains all loss functions
-     - metrics.py : contains several metrics used to quantify training progress (mean dice, surface distances)
-
-W/in data_utils:
-     - pituitarypineal.py : defines custom dataloader and sets up data augmentation
-     - transforms.py : sets up data augmentation functions (interfaces with cornucopia repo)
-
-W/in configs: these are files that define specific values for hyperparameter and network optimization:
-     - optimizer :  optimizer type, lr_start, lr_scheduler, weight_decay, momentum
-     - data : input modality combinations
-     - model : number of layers, activation function, possibly more once I get there
+## General workflow:
+- Run pglands_seg/train.py for training and pglands_seg/predict.py for inference
+- All tuneable input parameters are configured in configs/train.yaml or configs/predict.yaml
+- User can specify the following commandline arguments:
+  1. --config - specifies the .yaml file containing all input parameters. If none is specified, the default is configs/train.yaml.
+  2. --use_cuda - utilize CUDA for gpu support (if available, will default to cpu only if not specified)
+  3. --resume - resumes training from a previously saved checkpoint (requires the user to specify the model checkpoint path in the config file)
