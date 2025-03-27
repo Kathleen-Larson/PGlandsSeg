@@ -37,7 +37,7 @@ def main(pargs):
 
     # Parse other commandline args
     cpu_only = pargs.cpu_only
-    infer_only = pargs.predict
+    infer_only = True
     resume_training = pargs.resume
     
     # Set up device
@@ -53,33 +53,13 @@ def main(pargs):
     
     
     # Build data loaders
-    n_train_samples = None \
-        if infer_only or 'steps_per_epoch' not in config['training'] \
-        else config['training']['steps_per_epoch']
-
-    datasets = _config_datasets(data_config=config['dataset'],
-                                aug_config=config['augmentations'],
-                                log_dir=config['training']['output_dir'],
-                                infer_only=infer_only,
-                                device=device,
-    )
-    if 'train' in datasets:
-        n_train_samples = config['training']['steps_per_epoch'] \
-            if 'steps_per_epoch' in config['training'] \
-               else len(datasets['train'])
-    else:
-        n_train_samples = None
-        
-    loaders = {}
-    for key in datasets:
-        def _random_DL(dataset, config):
-            sampler = RandomSampler(dataset, replacement=True,
-                                    num_samples=n_train_samples)
-            return DataLoader(dataset, sampler=sampler, **config)
-        
-        loaders[key] = _random_DL(datasets[key], config['dataloader']) \
-            if key == 'train' and n_train_samples > len(datasets[key]) \
-               else DataLoader(datasets[key], **config['dataloader'])
+    dataset = _config_datasets(data_config=config['dataset'],
+                               aug_config=config['augmentations'],
+                               log_dir=config['training']['output_dir'],
+                               infer_only=infer_only,
+                               device=device,
+    )['test']
+    loader = DataLoader(dataset, **config['dataloader'])
         
     # Initialize model + optimizer
     network = UNet3D(in_channels=datasets['test'].__numinput__(),
@@ -98,33 +78,12 @@ def main(pargs):
                                  **config['training']
     )
         
-    # Print cohort #s info
-    n_test = len(datasets['test']) if 'test' in datasets else 0
-    n_train = len(datasets['train']) if 'train' in datasets else 0
-    n_valid = len(datasets['valid']) if 'valid' in datasets else 0
-
-    fstr = f'Train: {n_train} | Valid: {n_valid} | Test: {n_test}'
-    bffr = '-' * (len(fstr) + 2)
-    print(f'{bffr}\n {fstr}\n{bffr}')
-
-    # Run training
-    if not infer_only:
-        for epoch in range(segmenter.start_epoch, segmenter.max_n_epochs):
-            if not 'train' in loaders:
-                utils.fatal('No train loader exists... something went wrong')
-            segmenter._train(loader=loaders['train'])
-            
-            if 'valid' in loaders:
-                segmenter._predict(loader=loaders['valid'], loss_type='valid')
-
-        segmenter._epoch_end()
-
-    # Run inference
-    if 'test' in loaders:
-        segmenter._predict(
-            loader=loaders['test'], outbase='pglands',
-            save_outputs=True, write_posteriors=True,
-        )
+    # Run
+    print(f'Predicting labels for {len(datasets["test"])} input images')
+    segmenter._predict(
+        loader=loaders['test'], outbase='pglands',
+        save_outputs=True, write_posteriors=True,
+    )
         
 
 #------------------------------------------------------------------------------
@@ -155,6 +114,8 @@ def _config_optimizer(network_params, **config):
 
     return optimizer
 
+
 #------------------------------------------------------------------------------
+
 if __name__ == "__main__":
     main(utils.parse_args())
