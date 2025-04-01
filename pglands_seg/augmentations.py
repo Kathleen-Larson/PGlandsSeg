@@ -3,6 +3,7 @@ import numpy as np
 from numpy import random as npr
 import math
 import random
+import surfa as sf
 
 import torch
 import torch.nn as nn
@@ -175,7 +176,8 @@ class AffineElasticTransform:
         self.X = X
         self.apply_affine = apply_affine
         self.apply_elastic = apply_elastic
-
+        self.randomize = randomize
+        
         # Parse affine transform parameters
         if self.apply_affine:
             def _parse_affine_param(param, center=0.):
@@ -195,30 +197,36 @@ class AffineElasticTransform:
             self.rotation_bounds = _parse_affine_param(rotations)
             self.shear_bounds = _parse_affine_param(shears, center=0.)
             self.scale_bounds = _parse_affine_param(scales, center=1.)
-            
+        
         # Parse elastic transform parameters
         if self.apply_elastic:
             self.elastic_factor = elastic_factor
             self.elastic_std = elastic_std
             self.n_elastic_steps = n_elastic_steps
 
-    ##
-    def _make_affine(self, x):
+            
+    def _AffineDisplacementField(self, x):
+        """
+        Randomly sample parameters (translations, rotations, shearing, and
+        scaling) and generate affine transform
+        """        
         def _sample_params(bounds):
             bounds_range = torch.diff(bounds).squeeze()
             return torch.rand(self.X) * bounds_range + bounds[:,0]
 
+        n_vox = np.prod(tuple(x.shape[-self.X:]))
         I = torch.eye(self.X+1)
-
+        
         # Translations
         T = I.clone()
-        T[torch.arange(self.X),-1] = _sample_params(self.translation_bounds) 
-
+        T[torch.arange(self.X),-1] = _sample_params(self.translation_bounds)
+        
         # Shears
         Sinds = torch.ones((self.X+1,self.X+1), dtype=torch.bool)
         Sinds[torch.eye(self.X+1, dtype=torch.bool)] = False
         Sinds[-1,:] = False
         Sinds[:,-1] = False
+
         S = I.clone()
         S[Sinds] = torch.cat([_sample_params(self.shear_bounds),
                               _sample_params(self.shear_bounds)], dim=-1)
@@ -231,6 +239,7 @@ class AffineElasticTransform:
         # Rotations
         rotations = _sample_params(self.rotation_bounds) * torch.pi/180
         c, s = [torch.cos(rotations), torch.sin(rotations)]
+
         [R1, R2, R3] = [I.clone(), I.clone(), I.clone()]
         if self.X == 2:
             R1[torch.tensor([0,1,0,1]),
@@ -248,91 +257,162 @@ class AffineElasticTransform:
                torch.tensor([0,0,1,1])] = torch.tensor(
                    [c[2], s[2], -s[2], c[2]])
             
-        ## Convert affine matrix to displacement field
+        # Convert affine matrix to displacement field
         aff = (T @ R3 @ R2 @ R1 @ Z @ S).to(x.device)
-        grid = torch.stack(
-            torch.meshgrid([torch.arange(
-                -(s-1)/2, s/2, dtype=x.dtype, device=x.device
-            ) for s in x.shape[-self.X:]], indexing='ij')
+        grid = self._meshgrid_coords(x)
+        coords = torch.cat(
+            [self._meshgrid_coords(x).view(-1, self.X),
+             torch.ones((n_vox, 1)).to(x.device)
+            ], dim=-1
         )
-        coords = (
-            torch.cat([grid.view(-1, self.X),
-                       torch.ones((grid.numel()//self.X,1), device=x.device)
-            ], dim=-1).to(x.device) @ aff.transpose(0,1)
-        ).view(*x.shape[-self.X:], self.X + 1)
-        disp = 2 * coords[..., :self.X] / (
-            torch.tensor(x.shape[-self.X:], device=x.device) - 1
+        coords_aff = coords @ aff.transpose(-2, -1)
+        grid_aff = coords_aff[..., :self.X].view(*x.shape[-self.X:], -1)
+        disp = grid_aff.unsqueeze(0) * (
+            2 / (torch.tensor(x.shape[-self.X:]) - 1).to(x.device)
         )
         return disp
 
-    ##
-    def _make_elastic(self, x):
-        f = self.elastic_factor
-        n = self.n_elastic_steps
+        
+
+    def _ElasticDisplacementField(self, x):
+        """
+        Randomly generate an elastic deformation field
+        """
+        def _resize_shape(sz, mult):
+            return tuple(
+                torch.ceil(torch.tensor(sz) * mult).to(torch.int).tolist()
+            )
         
         # Get field shapes
-        sz_full = torch.tensor(x.size())
-        sz_small = torch.cat([torch.ceil(sz_full * f).to(torch.int),
-                              torch.tensor([self.X])])
-        sz_half = torch.cat([torch.ceil(sz_full * 0.5).to(torch.int),
-                             torch.tensor([self.X])])
+        sz_full = tuple(x.shape[-self.X:])
+        sz_small = (1, self.X) + _resize_shape(sz_full, self.elastic_factor)
+        sz_half = (1, self.X) + _resize_shape(sz_full, 0.5)
         
-        # Create SVF
-        svf_small = torch.normal(
-            mean=0., std=random.random(), size=tuple(sz_small)
-        ).to(x.device)
-        svf_half = torch.stack([
-            F.interpolate(svf_small[...,i],
-                          size=tuple(sz_half[-self.X-1:-1]),
-                          mode='trilinear' if self.X == 3 else 'bilinear'
-            ) for i in range(self.X)
-        ], dim=-1)
-        
-        # Scaling and squaring
-        svf_half = (svf_half / (2 ** n)).squeeze(1).movedim(-1,1)
-        grid_half = torch.stack(
-            torch.meshgrid(
-                [torch.arange(s, dtype=svf_half.dtype, device=x.device)
-                 for s in svf_half.shape[-self.X:]
-                ], indexing='ij'
-            ), dim=-1
-        ).movedim(-1,0).unsqueeze(0)
+        # Create small sized SVF
+        std = (random.uniform(0, self.elastic_std) if self.randomize
+               else self.elastic_std
+        )
+        svf_small = torch.normal(mean=0., std=std, size=sz_small).to(x.device)
 
-        weights = 2/torch.tensor(grid_half.shape[-self.X:], device=x.device)
+        # Resize to half of full shape
+        svf_half =  F.interpolate(
+            svf_small, size=sz_half[-self.X:],
+            mode='trilinear' if self.X == 3 else 'bilinear'
+        )
+
+        # Integrate w/ scaling and squaring to smooth
+        svf_half /= (2 ** self.n_elastic_steps)
+        grid_half = self._meshgrid_coords(svf_half)
+
+        weights = 2 / (torch.tensor(sz_half[-self.X:])).to(x.device)
         
         for _ in range(self.n_elastic_steps - 1):
-            grid_interp = (svf_half + grid_half).movedim(1,-1) * weights
-            svf_half += F.grid_sample(svf_half, grid_interp,
-                                      align_corners=True)
-        
+            grid_interp = weights * (svf_half.movedim(1, -1) + grid_half)
+            svf_half += F.grid_sample(
+                svf_half, grid_interp, align_corners=True, mode='bilinear'
+            )
+
         # Interpolate to full size
         elastic = F.interpolate(
             svf_half, size=sz_full[-self.X:], align_corners=True,
             mode='trilinear' if self.X == 3 else 'bilinear'
-        ).movedim(1,-1)
+        )
+        disp = elastic.movedim(1,-1) * (
+            2 / (torch.tensor(x.shape[-self.X:]) - 1).to(x.device)
+        )
+        return disp
+
         return elastic
+        
 
-    ##
+    def _meshgrid_coords(self, x):
+        """
+        Creates a meshgrid centered around origin for a tensor of 
+        shape=x.size=[N, C, H, W, D]
+        """
+        grid = torch.stack(
+            torch.meshgrid(
+                [torch.arange(0, s, dtype=x.dtype, device=x.device)
+                 for s in x.shape[-self.X:]
+                ], indexing='ij'
+            ), dim=-1
+        )
+        grid -= ((grid.max() - grid.min()) / 2.)
+        return grid
+    
+
     def __call__(self, inputs):
-        if self.apply_affine and self.apply_elastic:
-            A = self._make_affine(inputs[0]).unsqueeze(0)
-            E = self._make_elastic(inputs[0])
-            T = A + E
-        elif self.apply_affine:
-            T = self._make_affine(inputs[0]).unsqueeze(0)
-        elif self.apply_elastic:
-            T = self._make_elastic(inputs[0])
-        else:
-            T = None
+        A = (self._AffineDisplacementField(inputs[0]) if self.apply_affine
+             else None)
+        E = (self._ElasticDisplacementField(inputs[0]) if self.apply_elastic
+             else None)
 
+        if A is None and E is None:
+            T = None
+        elif A is not None and E is not None:
+            T = A + E
+        else:
+            T = E + self._meshgrid_coords(inputs[0]) * (
+                2 / torch.tensor(inputs[0].shape[-self.X:])
+	    ).to(inputs[0].device) if A is None else A
+        
         if T is not None:
+            inputs = [
+                F.grid_sample(
+                    x.to(torch.float), T.permute(0, 3, 2, 1, 4),
+                    align_corners=True, mode='bilinear'
+                ) for x in inputs
+            ]
+            surfa_visualize(inputs[0])
+            exit()
+        return inputs
+
+
+        """
+        # Make affine/elastic components
+        A = (self._AffineDisplacementField(inputs[0]) if self.apply_affine
+             else None)
+        E = (self._ElasticDisplacementField(inputs[0]) if self.apply_elastic
+             else None)
+        E = None
+        # Combine into transform
+        if A is None and E is None:
+            T = None
+        elif A is not None and E is not None:
+            E = self._spatial_transform(E.movedim(-1, 1), tr=A).movedim(1, -1)
+            T = self._disp_field_to_abs_coords(A + E)
+
+            T = self._disp_field_to_abs_coords(
+                A + self._spatial_transform(
+                    E, tr=A
+                ).movedim(1, -1)
+            )
+            
+        else:
+            T = self._disp_field_to_abs_coords(A if E is None else E)
+
+        # Apply
+        invol = inputs[0].clone()
+        if T is not None:
+            invol = inputs[0].clone()
+            T = torch.ones((1, 256, 256, 256, 3), device=invol.device)
+            outvol = self._spatial_transform(invol, T)
+            
+            inputs = [
+                F.grid_sample(x.to(torch.float), T, #self._disp_to_coords(T),
+                              align_corners=True, mode='bilinear'
+                ) for x in inputs
+            ]
             inputs = [
                 F.grid_sample(x.to(torch.float), T.permute(0, 3, 2, 1, 4),
                               align_corners=True, mode='bilinear'
                 ) for x in inputs
             ]
+           
+            surfa_visualize(outvol)
+        exit()
         return inputs
-
+        """
     
 #------------------------------------------------------------------------------
 
@@ -508,3 +588,14 @@ class ComposeTransforms:
             if T is not None:
                 inputs = T(inputs)
         return inputs
+
+
+def surfa_visualize(x):
+    fv = sf.vis.Freeview()
+    x = [x] if not isinstance(x, list) else x
+    for img in x:
+        img = img.cpu().numpy().squeeze(0)
+        for chn in range(img.shape[0]):
+            fv.add_image(img[chn, ...])
+    fv.show()
+        

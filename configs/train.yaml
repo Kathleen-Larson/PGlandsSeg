@@ -17,7 +17,7 @@ augmentations:
       - 0.15
       shears:
       - -0.012
-      - 0.12
+      - 0.012
       translations:
       - 0.0
       - 0.0
@@ -64,7 +64,7 @@ dataloader:
 
 dataset:
   input_data_config: configs/input_data_config.csv
-  lut: 'pglands.min.ctab'
+  lut: data/pglands.min.ctab
   n_splits: 3
   randomize: false
 
@@ -93,8 +93,8 @@ optimizer:
 training:
   checkpoint_path:
   loss_funcs:
-  - models.loss_functions.mean_mse_loss_logits_yesbackground
-  - models.loss_functions.mean_dice_loss_yesbackground
+  - loss_functions.mean_mse_loss_logits_yesbackground
+  - loss_functions.mean_dice_loss_yesbackground
   max_n_epochs: 200
   max_n_steps:
   output_dir: data/test

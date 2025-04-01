@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import autocast
 
-import utils, models
+import utils, loss_functions
 
 
 #------------------------------------------------------------------------------
@@ -27,6 +27,7 @@ class PGlandsSegmenter:
                  max_n_steps:int=None,
                  n_train_samples:int=None,
                  output_dir:str=None,
+                 resume_training:bool=False,
                  save_outputs_every:int=None,
                  start_aug_on:int=None,
                  steps_per_epoch:int=None,
@@ -88,6 +89,11 @@ class PGlandsSegmenter:
         self.start_epoch = 0
         
         # Load state (if necessary)
+        if self.checkpoint_path is None and resume_training:
+            utils.fatal('Error: no model checkpoint path provided in input '
+                        '.yaml config file (should be under '
+                        'configs["training"]["checkpoint_path"])')
+        
         if self.checkpoint_path is not None:
             if not os.path.isfile(self.checkpoint_path):
                 utils.fatal(f'Training checkpoint {self.checkpoint_path} not '
