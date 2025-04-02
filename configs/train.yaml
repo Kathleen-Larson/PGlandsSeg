@@ -1,6 +1,14 @@
 seed: 0
 
 augmentations:
+  _transform_order:
+    - FlipTransform
+    - AffineElasticTransform
+    - CropPatch
+    - BiasField
+    - GaussianNoise
+    - MinMaxNorm
+    - GammaTransform
   full:
     AffineElasticTransform:
       apply_affine: true

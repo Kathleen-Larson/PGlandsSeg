@@ -1,6 +1,9 @@
 seed: 0
 
 augmentations:
+  _transform_order:
+    - CropPatch
+    - MinMaxNorm
   full:
     CropPatch:
       center_crop: false

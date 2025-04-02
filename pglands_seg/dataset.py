@@ -13,7 +13,7 @@ from scipy import ndimage
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-from models import augmentations as aug
+import augmentations as aug
 import utils
 
 
@@ -49,12 +49,14 @@ class PGlandsDataset(Dataset):
                          for flist in self.image_files]
         
         # Set up augmentations
-        aug_list = [] if infer_only \
-            else [aug.AssignOneHotLabels(label_values=[x for x in lut])]
-        for aug_name in aug_config[aug_type]:
-            aug_list += [
-                getattr(aug, aug_name)(**aug_config[aug_type][aug_name])
-            ]
+        aug_list = [
+            None if infer_only
+            else aug.AssignOneHotLabels(label_values=[x for x in lut])
+        ]
+        aug_list += [getattr(aug, func)(**aug_config[aug_type][func])
+                     for func in aug_config['_transform_order']
+                     if func in aug_config[aug_type]
+        ]
         self.augmentations = aug.ComposeTransforms(aug_list)
             
         # Store native image geometries and crop windows
@@ -134,7 +136,7 @@ def _config_datasets(data_config:dict, aug_config:dict, infer_only:bool=False,
 
     # Load label lut
     if not os.path.isfile(data_config['lut']):
-        utils.fatal(f'{lut} does not exist')
+        utils.fatal(f'{data_config["lut"]} does not exist')
     lut = sf.load_label_lookup(data_config['lut'])
     
     # Load input data config
@@ -190,7 +192,7 @@ def _config_datasets(data_config:dict, aug_config:dict, infer_only:bool=False,
         print(f'Mismatch between data_config["n_splits"] and number of '
               'SplitIds in input data config.. using n_split = '
               'len(set(data_split_ids)) = {len(set(data_split_ids))}')
-    if infer_only or n_splits == 1:
+    if infer_only:
         n_splits = 1
         data_split_names = ['test']
         idxs_lists = [np.arange(0, image_files.shape[0]).tolist()]
@@ -202,7 +204,6 @@ def _config_datasets(data_config:dict, aug_config:dict, infer_only:bool=False,
             split_idxs = [0] + [
                 n_unique - (j+1) * x for j in reversed(range(n_splits-1))
             ] + [n_unique]
-            split_idxs = [0] + split_idxs + [n_unique]
             idx_groups = [np.where(ref_file_list == ref)[0].tolist()
                           for ref in unique_refs]
             idxs_lists = [
